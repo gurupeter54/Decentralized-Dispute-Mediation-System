@@ -7,6 +7,13 @@
 (define-constant ERR-NOT-JUROR (err u105))
 (define-constant ERR-DISPUTE-EXPIRED (err u106))
 
+(define-constant ERR-EVIDENCE-ALREADY-EXISTS (err u107))
+(define-constant ERR-EVIDENCE-DEADLINE-PASSED (err u108))
+(define-constant ERR-INVALID-HASH (err u109))
+(define-constant ERR-EVIDENCE-NOT-FOUND (err u110))
+
+(define-data-var evidence-deadline-blocks uint u72)
+
 (define-data-var dispute-counter uint u0)
 (define-data-var juror-pool-size uint u0)
 (define-data-var dispute-fee uint u1000000)
@@ -187,4 +194,70 @@
     (map-set arbitrator-ratings arbitrator 
       (if successful (+ current-rating u1) current-rating))
   )
+)
+
+(define-map evidence-storage
+  { dispute-id: uint, submitter: principal, evidence-index: uint }
+  {
+    hash: (buff 32),
+    description: (string-utf8 200),
+    submitted-at: uint,
+    evidence-type: (string-ascii 10)
+  }
+)
+
+(define-map dispute-evidence-count uint uint)
+
+(define-public (submit-evidence 
+  (dispute-id uint) 
+  (evidence-hash (buff 32)) 
+  (description (string-utf8 200)) 
+  (evidence-type (string-ascii 10)))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+        (current-block stacks-block-height)
+        (evidence-count (default-to u0 (map-get? dispute-evidence-count dispute-id)))
+        (evidence-key { dispute-id: dispute-id, submitter: tx-sender, evidence-index: evidence-count }))
+    (asserts! (is-eq (get status dispute) "pending") ERR-INVALID-STATUS)
+    (asserts! (< current-block (+ (get created-at dispute) (var-get evidence-deadline-blocks))) ERR-EVIDENCE-DEADLINE-PASSED)
+    (asserts! (> (len evidence-hash) u0) ERR-INVALID-HASH)
+    (asserts! (or (is-eq tx-sender (get plaintiff dispute)) (is-eq tx-sender (get defendant dispute))) ERR-UNAUTHORIZED)
+    (asserts! (is-none (map-get? evidence-storage evidence-key)) ERR-EVIDENCE-ALREADY-EXISTS)
+    (map-set evidence-storage evidence-key {
+      hash: evidence-hash,
+      description: description,
+      submitted-at: current-block,
+      evidence-type: evidence-type
+    })
+    (map-set dispute-evidence-count dispute-id (+ evidence-count u1))
+    (ok evidence-count)
+  )
+)
+
+(define-public (set-evidence-deadline (new-deadline uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set evidence-deadline-blocks new-deadline)
+    (ok true)
+  )
+)
+
+(define-read-only (get-evidence (dispute-id uint) (submitter principal) (evidence-index uint))
+  (map-get? evidence-storage { dispute-id: dispute-id, submitter: submitter, evidence-index: evidence-index })
+)
+
+(define-read-only (get-dispute-evidence-count (dispute-id uint))
+  (default-to u0 (map-get? dispute-evidence-count dispute-id))
+)
+
+(define-read-only (verify-evidence-hash (dispute-id uint) (submitter principal) (evidence-index uint) (provided-hash (buff 32)))
+  (let ((evidence (map-get? evidence-storage { dispute-id: dispute-id, submitter: submitter, evidence-index: evidence-index })))
+    (match evidence
+      stored-evidence (is-eq (get hash stored-evidence) provided-hash)
+      false
+    )
+  )
+)
+
+(define-read-only (get-evidence-deadline)
+  (var-get evidence-deadline-blocks)
 )
