@@ -12,6 +12,15 @@
 (define-constant ERR-INVALID-HASH (err u109))
 (define-constant ERR-EVIDENCE-NOT-FOUND (err u110))
 
+(define-constant ERR-INSUFFICIENT-STAKE (err u111))
+(define-constant ERR-ARBITRATOR-NOT-STAKED (err u112))
+(define-constant ERR-STAKE-LOCKED (err u113))
+
+(define-data-var minimum-arbitrator-stake uint u5000000)
+(define-data-var stake-lock-duration uint u1008)
+(define-data-var penalty-rate uint u10)
+(define-data-var reward-rate uint u5)
+
 (define-data-var evidence-deadline-blocks uint u72)
 
 (define-data-var dispute-counter uint u0)
@@ -260,4 +269,98 @@
 
 (define-read-only (get-evidence-deadline)
   (var-get evidence-deadline-blocks)
+)
+
+
+(define-map arbitrator-stakes
+  principal
+  {
+    amount: uint,
+    locked-until: uint,
+    disputes-handled: uint,
+    successful-resolutions: uint,
+    total-earned: uint,
+    total-penalized: uint
+  }
+)
+
+(define-map dispute-arbitrator-rewards uint uint)
+
+(define-public (stake-as-arbitrator (amount uint))
+  (let ((current-stake (default-to {amount: u0, locked-until: u0, disputes-handled: u0, 
+                                   successful-resolutions: u0, total-earned: u0, 
+                                   total-penalized: u0} 
+                                  (map-get? arbitrator-stakes tx-sender)))
+        (total-stake (+ (get amount current-stake) amount)))
+    (asserts! (>= total-stake (var-get minimum-arbitrator-stake)) ERR-INSUFFICIENT-STAKE)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set arbitrator-stakes tx-sender 
+      (merge current-stake {amount: total-stake}))
+    (ok total-stake)
+  )
+)
+
+(define-public (unstake-arbitrator)
+  (let ((stake-data (unwrap! (map-get? arbitrator-stakes tx-sender) ERR-ARBITRATOR-NOT-STAKED))
+        (current-block stacks-block-height))
+    (asserts! (< (get locked-until stake-data) current-block) ERR-STAKE-LOCKED)
+    (try! (as-contract (stx-transfer? (get amount stake-data) tx-sender tx-sender)))
+    (map-delete arbitrator-stakes tx-sender)
+    (ok (get amount stake-data))
+  )
+)
+
+(define-public (process-arbitrator-performance (dispute-id uint) (performance-score uint))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+        (arbitrator (get arbitrator dispute))
+        (stake-data (unwrap! (map-get? arbitrator-stakes arbitrator) ERR-ARBITRATOR-NOT-STAKED))
+        (amount (get amount dispute))
+        (reward-amount (/ (* amount (var-get reward-rate)) u100))
+        (penalty-amount (/ (* amount (var-get penalty-rate)) u100)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (if (>= performance-score u70)
+      (begin
+        (try! (as-contract (stx-transfer? reward-amount tx-sender arbitrator)))
+        (map-set arbitrator-stakes arbitrator
+          (merge stake-data {
+            disputes-handled: (+ (get disputes-handled stake-data) u1),
+            successful-resolutions: (+ (get successful-resolutions stake-data) u1),
+            total-earned: (+ (get total-earned stake-data) reward-amount)
+          }))
+        (map-set dispute-arbitrator-rewards dispute-id reward-amount))
+      (begin
+        (let ((penalty (if (> performance-score u70) penalty-amount (get amount stake-data))))
+          (map-set arbitrator-stakes arbitrator
+            (merge stake-data {
+              amount: (- (get amount stake-data) penalty),
+              disputes-handled: (+ (get disputes-handled stake-data) u1),
+              total-penalized: (+ (get total-penalized stake-data) penalty),
+              locked-until: (+ stacks-block-height (var-get stake-lock-duration))
+            }))
+          (map-set dispute-arbitrator-rewards dispute-id u0))))
+    (ok performance-score)
+  )
+)
+
+(define-read-only (get-arbitrator-stake (arbitrator principal))
+  (map-get? arbitrator-stakes arbitrator)
+)
+
+(define-read-only (get-arbitrator-reputation (arbitrator principal))
+  (let ((stake-data (map-get? arbitrator-stakes arbitrator)))
+    (match stake-data
+      data (if (> (get disputes-handled data) u0)
+             (/ (* (get successful-resolutions data) u100) (get disputes-handled data))
+             u0)
+      u0)
+  )
+)
+
+(define-read-only (is-qualified-arbitrator (arbitrator principal))
+  (let ((stake-data (map-get? arbitrator-stakes arbitrator)))
+    (match stake-data
+      data (and (>= (get amount data) (var-get minimum-arbitrator-stake))
+               (< (get locked-until data) stacks-block-height))
+      false)
+  )
 )
