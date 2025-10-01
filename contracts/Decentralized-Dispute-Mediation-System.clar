@@ -16,6 +16,13 @@
 (define-constant ERR-ARBITRATOR-NOT-STAKED (err u112))
 (define-constant ERR-STAKE-LOCKED (err u113))
 
+(define-constant ERR-APPEAL-WINDOW-CLOSED (err u114))
+(define-constant ERR-ALREADY-APPEALED (err u115))
+(define-constant ERR-INSUFFICIENT-APPEAL-BOND (err u116))
+
+(define-data-var appeal-window-blocks uint u72)
+(define-data-var appeal-bond-multiplier uint u2)
+
 (define-data-var minimum-arbitrator-stake uint u5000000)
 (define-data-var stake-lock-duration uint u1008)
 (define-data-var penalty-rate uint u10)
@@ -363,4 +370,77 @@
                (< (get locked-until data) stacks-block-height))
       false)
   )
+)
+
+(define-map dispute-appeals uint {
+  appealed-by: principal,
+  appeal-bond: uint,
+  appealed-at: uint,
+  new-jurors: (list 5 principal),
+  appeal-votes-for: uint,
+  appeal-votes-against: uint,
+  appeal-resolved: bool
+})
+
+(define-map appeal-votes { dispute-id: uint, juror: principal } bool)
+
+(define-public (appeal-dispute (dispute-id uint))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+        (current-block stacks-block-height)
+        (appeal-bond (* (get amount dispute) (var-get appeal-bond-multiplier)))
+        (selected-jurors (select-random-jurors)))
+    (asserts! (is-some (get resolved-at dispute)) ERR-INVALID-STATUS)
+    (asserts! (< current-block (+ (unwrap-panic (get resolved-at dispute)) (var-get appeal-window-blocks))) ERR-APPEAL-WINDOW-CLOSED)
+    (asserts! (is-none (map-get? dispute-appeals dispute-id)) ERR-ALREADY-APPEALED)
+    (asserts! (or (is-eq tx-sender (get plaintiff dispute)) (is-eq tx-sender (get defendant dispute))) ERR-UNAUTHORIZED)
+    (asserts! (>= (stx-get-balance tx-sender) appeal-bond) ERR-INSUFFICIENT-APPEAL-BOND)
+    (try! (stx-transfer? appeal-bond tx-sender (as-contract tx-sender)))
+    (map-set dispute-appeals dispute-id {
+      appealed-by: tx-sender,
+      appeal-bond: appeal-bond,
+      appealed-at: current-block,
+      new-jurors: selected-jurors,
+      appeal-votes-for: u0,
+      appeal-votes-against: u0,
+      appeal-resolved: false
+    })
+    (ok appeal-bond)
+  )
+)
+
+(define-public (cast-appeal-vote (dispute-id uint) (vote-for bool))
+  (let ((appeal (unwrap! (map-get? dispute-appeals dispute-id) ERR-DISPUTE-NOT-FOUND))
+        (vote-key {dispute-id: dispute-id, juror: tx-sender}))
+    (asserts! (is-some (index-of (get new-jurors appeal) tx-sender)) ERR-NOT-JUROR)
+    (asserts! (is-none (map-get? appeal-votes vote-key)) ERR-ALREADY-VOTED)
+    (asserts! (is-eq (get appeal-resolved appeal) false) ERR-INVALID-STATUS)
+    (map-set appeal-votes vote-key vote-for)
+    (if vote-for
+      (map-set dispute-appeals dispute-id (merge appeal {appeal-votes-for: (+ (get appeal-votes-for appeal) u1)}))
+      (map-set dispute-appeals dispute-id (merge appeal {appeal-votes-against: (+ (get appeal-votes-against appeal) u1)}))
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-appeal (dispute-id uint))
+  (let ((dispute (unwrap! (map-get? disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+        (appeal (unwrap! (map-get? dispute-appeals dispute-id) ERR-DISPUTE-NOT-FOUND))
+        (original-winner (get status dispute))
+        (appeal-winner (if (> (get appeal-votes-for appeal) (get appeal-votes-against appeal)) "plaintiff" "defendant")))
+    (asserts! (is-eq (get appeal-resolved appeal) false) ERR-INVALID-STATUS)
+    (map-set dispute-appeals dispute-id (merge appeal {appeal-resolved: true}))
+    (if (is-eq appeal-winner original-winner)
+      (try! (as-contract (stx-transfer? (get appeal-bond appeal) tx-sender (get appealed-by appeal))))
+      (begin
+        (map-set disputes dispute-id (merge dispute {status: appeal-winner}))
+        (try! (as-contract (stx-transfer? (get appeal-bond appeal) tx-sender (get appealed-by appeal))))
+      )
+    )
+    (ok appeal-winner)
+  )
+)
+
+(define-read-only (get-appeal-info (dispute-id uint))
+  (map-get? dispute-appeals dispute-id)
 )
