@@ -20,6 +20,11 @@
 (define-constant ERR-ALREADY-APPEALED (err u115))
 (define-constant ERR-INSUFFICIENT-APPEAL-BOND (err u116))
 
+(define-constant ERR-TEMPLATE-NOT-FOUND (err u117))
+(define-constant ERR-INVALID-TEMPLATE (err u118))
+
+(define-data-var template-counter uint u0)
+
 (define-data-var appeal-window-blocks uint u72)
 (define-data-var appeal-bond-multiplier uint u2)
 
@@ -443,4 +448,70 @@
 
 (define-read-only (get-appeal-info (dispute-id uint))
   (map-get? dispute-appeals dispute-id)
+)
+
+(define-map dispute-templates
+  uint
+  {
+    name: (string-ascii 30),
+    base-fee: uint,
+    percentage-fee: uint,
+    min-fee: uint,
+    max-fee: uint,
+    active: bool
+  }
+)
+
+(define-map dispute-template-usage uint uint)
+
+(define-public (create-dispute-template 
+  (name (string-ascii 30))
+  (base-fee uint)
+  (percentage-fee uint)
+  (min-fee uint)
+  (max-fee uint))
+  (let ((template-id (+ (var-get template-counter) u1)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (map-set dispute-templates template-id {
+      name: name,
+      base-fee: base-fee,
+      percentage-fee: percentage-fee,
+      min-fee: min-fee,
+      max-fee: max-fee,
+      active: true
+    })
+    (var-set template-counter template-id)
+    (map-set dispute-template-usage template-id u0)
+    (ok template-id)
+  )
+)
+
+(define-public (toggle-template (template-id uint))
+  (let ((template (unwrap! (map-get? dispute-templates template-id) ERR-TEMPLATE-NOT-FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (map-set dispute-templates template-id 
+      (merge template {active: (not (get active template))}))
+    (ok (not (get active template)))
+  )
+)
+
+(define-read-only (calculate-template-fee (template-id uint) (disputed-amount uint))
+  (let ((template (unwrap! (map-get? dispute-templates template-id) ERR-TEMPLATE-NOT-FOUND)))
+    (let ((calculated-fee (+ (get base-fee template) 
+                             (/ (* disputed-amount (get percentage-fee template)) u10000))))
+      (ok (if (< calculated-fee (get min-fee template))
+            (get min-fee template)
+            (if (> calculated-fee (get max-fee template))
+              (get max-fee template)
+              calculated-fee)))
+    )
+  )
+)
+
+(define-read-only (get-template (template-id uint))
+  (map-get? dispute-templates template-id)
+)
+
+(define-read-only (get-template-usage (template-id uint))
+  (default-to u0 (map-get? dispute-template-usage template-id))
 )
